@@ -1,19 +1,62 @@
 import { Octokit } from '@octokit/rest';
 import { config } from '../utils/config.js';
+import { getToken } from '../utils/token-store.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { scratchPath } from '../utils/scratch.js';
 
-let octokit = null;
+// Cache Octokit instances per token to avoid re-creating them
+const octokitCache = new Map();
 
-function getOctokit() {
-  if (!octokit) {
-    if (!config.githubToken) {
-      throw new Error('GITHUB_TOKEN is not configured. Cannot access GitHub API.');
+/**
+ * Get an Octokit instance for the given context.
+ * Priority: user's personal PAT > bot's default token.
+ * Returns { octokit, source } where source describes whose token is being used.
+ */
+function getOctokit(context = {}) {
+  // Try user's personal token first
+  let token = null;
+  let source = 'none';
+
+  if (context.discordUserId) {
+    const userToken = getToken(context.discordUserId);
+    if (userToken) {
+      token = userToken;
+      source = 'personal';
     }
-    octokit = new Octokit({ auth: config.githubToken });
   }
-  return octokit;
+
+  // Fall back to bot's default token
+  if (!token && config.githubToken) {
+    token = config.githubToken;
+    source = 'bot-default';
+  }
+
+  if (!token) {
+    throw new Error(
+      'No GitHub token available. Either configure GITHUB_TOKEN in the bot, ' +
+      'or DM me with `!claude token set ghp_YOUR_TOKEN` to register your personal access token.'
+    );
+  }
+
+  // Cache by token (first 8 chars as key to avoid storing full token in memory as a map key)
+  const cacheKey = token.slice(0, 8) + token.slice(-4);
+  if (!octokitCache.has(cacheKey)) {
+    octokitCache.set(cacheKey, new Octokit({ auth: token }));
+  }
+
+  return { octokit: octokitCache.get(cacheKey), source, token };
+}
+
+/**
+ * Resolve which token to use for a fetch request (file downloads).
+ */
+function getAuthToken(context = {}) {
+  if (context.discordUserId) {
+    const userToken = getToken(context.discordUserId);
+    if (userToken) return userToken;
+  }
+  return config.githubToken || null;
 }
 
 function parseRepo(repoStr) {
@@ -57,7 +100,7 @@ export const toolDefinitions = [
   },
   {
     name: 'github_comment_issue',
-    description: 'Post a comment on a GitHub issue.',
+    description: 'Post a comment on a GitHub issue. The comment will be posted using the requesting user\'s GitHub identity if they have registered a personal access token.',
     input_schema: {
       type: 'object',
       properties: {
@@ -96,31 +139,35 @@ export const toolDefinitions = [
 ];
 
 // --- Tool handlers ---
+// All handlers accept (input, context) where context = { discordUserId }
 
-export async function github_list_issues({ repo, state = 'open', labels, per_page = 20, page = 1 }) {
+export async function github_list_issues({ repo, state = 'open', labels, per_page = 20, page = 1 }, context) {
   const { owner, repo: repoName } = parseRepo(repo);
-  const ok = getOctokit();
+  const { octokit: ok, source } = getOctokit(context);
 
   const params = { owner, repo: repoName, state, per_page: Math.min(per_page, 100), page };
   if (labels) params.labels = labels;
 
   const { data } = await ok.issues.listForRepo(params);
 
-  return data.map(issue => ({
-    number: issue.number,
-    title: issue.title,
-    state: issue.state,
-    labels: issue.labels.map(l => (typeof l === 'string' ? l : l.name)),
-    author: issue.user?.login,
-    created_at: issue.created_at,
-    comments: issue.comments,
-    is_pull_request: !!issue.pull_request,
-  }));
+  return {
+    auth_source: source,
+    issues: data.map(issue => ({
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      labels: issue.labels.map(l => (typeof l === 'string' ? l : l.name)),
+      author: issue.user?.login,
+      created_at: issue.created_at,
+      comments: issue.comments,
+      is_pull_request: !!issue.pull_request,
+    })),
+  };
 }
 
-export async function github_get_issue({ repo, issue_number }) {
+export async function github_get_issue({ repo, issue_number }, context) {
   const { owner, repo: repoName } = parseRepo(repo);
-  const ok = getOctokit();
+  const { octokit: ok, source } = getOctokit(context);
 
   const [{ data: issue }, { data: comments }] = await Promise.all([
     ok.issues.get({ owner, repo: repoName, issue_number }),
@@ -128,6 +175,7 @@ export async function github_get_issue({ repo, issue_number }) {
   ]);
 
   return {
+    auth_source: source,
     number: issue.number,
     title: issue.title,
     state: issue.state,
@@ -143,20 +191,36 @@ export async function github_get_issue({ repo, issue_number }) {
   };
 }
 
-export async function github_comment_issue({ repo, issue_number, body }) {
+export async function github_comment_issue({ repo, issue_number, body }, context) {
   const { owner, repo: repoName } = parseRepo(repo);
-  const ok = getOctokit();
+  const { octokit: ok, source } = getOctokit(context);
+
+  // Look up who will be posting this comment
+  let actingAs = 'bot-default-account';
+  try {
+    const { data: user } = await ok.users.getAuthenticated();
+    actingAs = user.login;
+  } catch {
+    // Non-critical — just won't show the username
+  }
 
   const { data } = await ok.issues.createComment({
     owner, repo: repoName, issue_number, body,
   });
 
-  return { id: data.id, url: data.html_url, created_at: data.created_at };
+  return {
+    id: data.id,
+    url: data.html_url,
+    created_at: data.created_at,
+    posted_as: actingAs,
+    auth_source: source,
+  };
 }
 
-export async function github_download_issue_files({ repo, issue_number }) {
+export async function github_download_issue_files({ repo, issue_number }, context) {
   const { owner, repo: repoName } = parseRepo(repo);
-  const ok = getOctokit();
+  const { octokit: ok } = getOctokit(context);
+  const authToken = getAuthToken(context);
 
   const [{ data: issue }, { data: comments }] = await Promise.all([
     ok.issues.get({ owner, repo: repoName, issue_number }),
@@ -181,7 +245,7 @@ export async function github_download_issue_files({ repo, issue_number }) {
     try {
       const filename = decodeURIComponent(url.split('/').pop().split('?')[0]);
       const resp = await fetch(url, {
-        headers: config.githubToken ? { Authorization: `token ${config.githubToken}` } : {},
+        headers: authToken ? { Authorization: `token ${authToken}` } : {},
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buffer = Buffer.from(await resp.arrayBuffer());
@@ -196,9 +260,9 @@ export async function github_download_issue_files({ repo, issue_number }) {
   return { directory: destDir, files: downloaded };
 }
 
-export async function github_get_file({ repo, path, ref }) {
+export async function github_get_file({ repo, path, ref }, context) {
   const { owner, repo: repoName } = parseRepo(repo);
-  const ok = getOctokit();
+  const { octokit: ok, source } = getOctokit(context);
 
   const params = { owner, repo: repoName, path };
   if (ref) params.ref = ref;
@@ -206,7 +270,7 @@ export async function github_get_file({ repo, path, ref }) {
   const { data } = await ok.repos.getContent(params);
 
   if (Array.isArray(data)) {
-    return { type: 'directory', entries: data.map(e => ({ name: e.name, type: e.type, size: e.size })) };
+    return { type: 'directory', auth_source: source, entries: data.map(e => ({ name: e.name, type: e.type, size: e.size })) };
   }
 
   if (data.encoding === 'base64' && data.content) {
@@ -219,6 +283,7 @@ export async function github_get_file({ repo, path, ref }) {
 
     return {
       type: 'file',
+      auth_source: source,
       path: data.path,
       size: data.size,
       content: content.length > 50000 ? content.slice(0, 50000) + '\n...(truncated)' : content,
@@ -226,5 +291,5 @@ export async function github_get_file({ repo, path, ref }) {
     };
   }
 
-  return { type: 'file', path: data.path, size: data.size, note: 'Binary file — content not displayed.' };
+  return { type: 'file', auth_source: source, path: data.path, size: data.size, note: 'Binary file — content not displayed.' };
 }

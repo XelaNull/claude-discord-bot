@@ -1,6 +1,9 @@
 /**
  * Tool registry — maps tool names to their definitions and handlers.
  * This is the single source of truth for all available tools.
+ *
+ * Tools that interact with GitHub receive a `context` object containing
+ * the requesting user's Discord ID, so they can use per-user PATs.
  */
 
 import * as github from './github.js';
@@ -17,6 +20,15 @@ export const allToolDefinitions = [
   ...patch.toolDefinitions,
   ...self.toolDefinitions,
 ];
+
+// Tools that need user context for per-user GitHub auth
+const GITHUB_TOOLS = new Set([
+  'github_list_issues',
+  'github_get_issue',
+  'github_comment_issue',
+  'github_download_issue_files',
+  'github_get_file',
+]);
 
 // Map tool names to handler functions
 const handlers = {
@@ -52,9 +64,12 @@ const handlers = {
 
 /**
  * Execute a tool by name with the given input.
- * Returns the result as a JSON-serializable object.
+ * @param {string} name - Tool name
+ * @param {object} input - Tool input (from Claude)
+ * @param {object} context - Execution context { discordUserId }
+ * @returns the result as a JSON-serializable object.
  */
-export async function executeTool(name, input) {
+export async function executeTool(name, input, context = {}) {
   const handler = handlers[name];
   if (!handler) {
     throw new Error(`Unknown tool: ${name}`);
@@ -64,7 +79,10 @@ export async function executeTool(name, input) {
   const start = Date.now();
 
   try {
-    const result = await handler(input);
+    // GitHub tools receive context as a second argument for per-user auth
+    const result = GITHUB_TOOLS.has(name)
+      ? await handler(input, context)
+      : await handler(input);
     const elapsed = Date.now() - start;
     console.log(`[tool] ${name} completed in ${elapsed}ms`);
     return result;

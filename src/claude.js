@@ -9,11 +9,12 @@ const client = new Anthropic({ apiKey: config.anthropicApiKey });
  * Keeps calling Claude until it returns a text-only response (no more tool calls).
  *
  * @param {Array} messages - Conversation history in Claude API format
+ * @param {object} context - Execution context passed to tools { discordUserId }
  * @param {Function} onToolUse - Callback when a tool is being used (for status updates)
  * @param {Function} onText - Callback for streaming text chunks (optional)
  * @returns {{ response: string, messages: Array, toolsUsed: string[] }}
  */
-export async function runClaudeLoop(messages, onToolUse, onText) {
+export async function runClaudeLoop(messages, context, onToolUse, onText) {
   let iterations = 0;
   const toolsUsed = [];
 
@@ -53,7 +54,7 @@ export async function runClaudeLoop(messages, onToolUse, onText) {
 
       let result;
       try {
-        result = await executeTool(toolUse.name, toolUse.input);
+        result = await executeTool(toolUse.name, toolUse.input, context);
       } catch (err) {
         result = { error: err.message };
       }

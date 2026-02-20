@@ -14,6 +14,8 @@ services:
       - scratch-data:/tmp/claude-scratch
       # Mount source code so self-modifications persist across rebuilds
       - ./src:/app/src
+      # Persist encrypted token store and other data
+      - ./data:/app/data
     logging:
       driver: json-file
       options:

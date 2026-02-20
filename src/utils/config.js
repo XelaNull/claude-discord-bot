@@ -44,7 +44,9 @@ Guidelines:
 - Use code blocks with language hints for code output.
 - If a task requires multiple steps, explain your plan briefly then execute.
 - For GitHub operations, confirm destructive actions before proceeding.
-- When self-modifying, explain what you're changing and why before doing it.`,
+- When self-modifying, explain what you're changing and why before doing it.
+- For write operations (commenting, pushing), the tool result includes auth_source and posted_as fields. Mention whose GitHub identity was used in your response (e.g., "Posted as @username").
+- If a user hasn't registered a personal GitHub token, suggest they DM the bot with \`token set ghp_TOKEN\` for actions to be performed under their identity.`,
 };
 
 // Validate required config
