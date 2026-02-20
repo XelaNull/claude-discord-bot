@@ -1,0 +1,24 @@
+services:
+  claude-bot:
+    build: .
+    container_name: claude-discord-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - SCRATCH_DIR=/tmp/claude-scratch
+      - BOT_SOURCE_DIR=/app
+    volumes:
+      # Persist scratch space across restarts
+      - scratch-data:/tmp/claude-scratch
+      # Mount source code so self-modifications persist across rebuilds
+      - ./src:/app/src
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  scratch-data:
