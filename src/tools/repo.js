@@ -1,236 +1,600 @@
-import { execSync } from 'child_process';
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync } from 'fs';
-import { join, relative } from 'path';
-import { config } from '../utils/config.js';
-import { scratchPath, ensureScratchDir } from '../utils/scratch.js';
+const { execFileSync, execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const config = require('../utils/config');
+const { getWorkspace, checkWorkspaceQuota } = require('../utils/workspace');
+const { analyzeLog, renderForLLM } = require('../utils/log-analyzer');
+const { getRepoDir, validatePath } = require('../utils/paths');
 
-// --- Tool definitions ---
+// Allowlist for the `shell` tool — only the leading command is validated.
+// Piped/chained commands after |, &&, ||, ; are allowed freely.
+// Edit this array to add or remove allowed commands.
+const SHELL_ALLOWLIST = [
+  // -- Filesystem & navigation --
+  'ls', 'find', 'tree', 'cat', 'head', 'tail', 'wc', 'du', 'df', 'file',
+  'stat', 'touch', 'mkdir', 'cp', 'mv', 'rm', 'ln', 'chmod', 'basename', 'dirname',
+  'realpath', 'readlink',
 
-export const toolDefinitions = [
-  {
-    name: 'clone_repo',
-    description: 'Clone a git repository to the scratch space for analysis. Supports GitHub shorthand "owner/repo" or full URLs.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        repo: { type: 'string', description: 'Repository URL or GitHub shorthand "owner/repo".' },
-        branch: { type: 'string', description: 'Specific branch to clone. Default: default branch.' },
-        depth: { type: 'number', description: 'Shallow clone depth. Default: 1 (shallow). Use 0 for full clone.' },
-      },
-      required: ['repo'],
-    },
-  },
-  {
-    name: 'list_files',
-    description: 'List files and directories in the scratch space. Supports glob-like browsing.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Path relative to scratch space. Default: root of scratch.' },
-        recursive: { type: 'boolean', description: 'List recursively. Default: false.' },
-        max_depth: { type: 'number', description: 'Max recursion depth. Default: 3.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'read_file',
-    description: 'Read the contents of a file in the scratch space.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'File path relative to scratch space.' },
-        start_line: { type: 'number', description: 'Start reading from this line (1-based). Default: 1.' },
-        end_line: { type: 'number', description: 'Read up to this line (inclusive). Default: end of file.' },
-      },
-      required: ['path'],
-    },
-  },
-  {
-    name: 'run_command',
-    description: 'Run a shell command within the scratch space. Useful for grep, find, tree, or other analysis commands. Commands are sandboxed to the scratch directory.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        command: { type: 'string', description: 'The shell command to run.' },
-        cwd: { type: 'string', description: 'Working directory relative to scratch space. Default: scratch root.' },
-        timeout: { type: 'number', description: 'Timeout in seconds. Default: 30.' },
-      },
-      required: ['command'],
-    },
-  },
+  // -- Text processing --
+  'grep', 'egrep', 'fgrep', 'sed', 'awk', 'sort', 'uniq', 'cut', 'tr', 'tee',
+  'diff', 'patch', 'xargs', 'comm', 'paste', 'fold', 'fmt', 'column', 'expand',
+  'unexpand', 'nl', 'rev', 'strings',
+
+  // -- Search --
+  'which', 'whereis', 'locate', 'type',
+
+  // -- Archive & compression --
+  'tar', 'gzip', 'gunzip', 'zip', 'unzip', 'bzip2', 'xz',
+
+  // -- Networking (read-only) --
+  'curl', 'wget', 'ping', 'dig', 'host', 'nslookup',
+
+  // -- Version control --
+  'git',
+
+  // -- Node.js / JavaScript --
+  'node', 'npm', 'npx', 'yarn', 'pnpm', 'tsc', 'eslint', 'prettier', 'jest', 'vitest', 'mocha',
+
+  // -- Python --
+  'python', 'python3', 'pip', 'pip3', 'pytest', 'pylint', 'black', 'mypy', 'ruff', 'uv',
+
+  // -- Build tools --
+  'make', 'cmake', 'cargo', 'go', 'dotnet', 'gradle', 'mvn', 'ant',
+
+  // -- Shells / scripting --
+  'bash', 'sh', 'env', 'echo', 'printf', 'true', 'false', 'test', 'expr',
+  'date', 'sleep', 'timeout',
+
+  // -- System info --
+  'uname', 'whoami', 'id', 'hostname', 'pwd', 'printenv',
 ];
 
-// --- Tool handlers ---
+// Extract the leading command from a shell input string.
+// Handles: "npm test", "  npm test", "FOO=bar npm test", "/usr/bin/node script.js"
+function extractLeadingCommand(input) {
+  const trimmed = input.trim();
 
-export async function clone_repo({ repo, branch, depth = 1 }) {
-  ensureScratchDir();
-
-  // Normalize repo URL
-  let repoUrl = repo;
-  if (!repo.includes('://') && !repo.startsWith('git@')) {
-    repoUrl = `https://github.com/${repo}.git`;
+  // Skip env var assignments at the start (e.g., "FOO=bar npm test")
+  const parts = trimmed.split(/\s+/);
+  let cmdPart = null;
+  for (const part of parts) {
+    if (part.includes('=') && !part.startsWith('-')) continue; // skip VAR=val
+    cmdPart = part;
+    break;
   }
 
-  // Derive directory name from repo
-  const repoName = repo.replace(/\.git$/, '').split('/').pop();
-  const destDir = scratchPath(repoName);
+  if (!cmdPart) return null;
 
-  if (existsSync(destDir)) {
-    // Pull latest instead of re-cloning
-    try {
-      execSync('git pull', { cwd: destDir, timeout: 60000, stdio: 'pipe' });
-      return { action: 'updated', directory: repoName, path: destDir };
-    } catch {
-      // If pull fails, remove and re-clone
-      execSync(`rm -rf "${destDir}"`, { timeout: 10000, stdio: 'pipe' });
+  // Strip path prefix (e.g., "/usr/bin/node" → "node", "./script.sh" → "script.sh")
+  const basename = cmdPart.split('/').pop();
+  return basename || null;
+}
+
+const tools = [
+  {
+    name: 'repo_clone',
+    description: 'Clone a GitHub repository to local scratch space for analysis. If already cloned, pulls latest changes.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository in owner/repo format' },
+        branch: { type: 'string', description: 'Branch to clone (default: default branch)' }
+      },
+      required: ['repo']
+    },
+    handler: async (args, context) => {
+      const repoDir = getRepoDir(args.repo);
+      fs.mkdirSync(config.scratchDir, { recursive: true });
+
+      if (fs.existsSync(repoDir)) {
+        // Already cloned — pull latest (Phase 1 fix: timeout on git pull)
+        try {
+          execFileSync('git', ['pull'], {
+            cwd: repoDir,
+            timeout: 60000,
+            stdio: 'pipe'
+          });
+          return JSON.stringify({ status: 'updated', path: repoDir });
+        } catch (err) {
+          return JSON.stringify({ status: 'pull_failed', error: err.message, path: repoDir });
+        }
+      }
+
+      // Phase 1 fix: execFileSync instead of execSync (no shell injection)
+      const cloneArgs = ['clone', '--depth', '1'];
+      if (args.branch) cloneArgs.push('--branch', args.branch);
+
+      // Use PAT for auth if available
+      const [owner, repo] = args.repo.split('/');
+      let url = `https://github.com/${owner}/${repo}.git`;
+      if (context && context.token) {
+        url = `https://x-access-token:${context.token}@github.com/${owner}/${repo}.git`;
+      }
+      cloneArgs.push(url, repoDir);
+
+      execFileSync('git', cloneArgs, { timeout: 120000, stdio: 'pipe' });
+
+      return JSON.stringify({ status: 'cloned', path: repoDir });
+    }
+  },
+
+  {
+    name: 'repo_list',
+    description: 'List files in a cloned repository directory.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository in owner/repo format' },
+        path: { type: 'string', description: 'Subdirectory path (default: root)' },
+        recursive: { type: 'boolean', description: 'List recursively (default: false)' }
+      },
+      required: ['repo']
+    },
+    handler: async (args) => {
+      const repoDir = getRepoDir(args.repo);
+
+      if (!fs.existsSync(repoDir)) {
+        throw new Error('Repository not cloned. Use repo_clone first.');
+      }
+
+      const targetDir = args.path ? validatePath(repoDir, args.path) : repoDir;
+
+      if (args.recursive) {
+        const files = [];
+        function walk(dir, prefix) {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.name === '.git') continue;
+            const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+            if (entry.isDirectory()) {
+              walk(path.join(dir, entry.name), rel);
+            } else {
+              files.push(rel);
+            }
+          }
+        }
+        walk(targetDir, '');
+        return JSON.stringify(files);
+      }
+
+      const entries = fs.readdirSync(targetDir, { withFileTypes: true });
+      const result = entries
+        .filter(e => e.name !== '.git')
+        .map(e => ({
+          name: e.name,
+          type: e.isDirectory() ? 'dir' : 'file'
+        }));
+
+      return JSON.stringify(result, null, 2);
+    }
+  },
+
+  {
+    name: 'repo_read',
+    description: 'Read the contents of a file from a cloned repository.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository in owner/repo format' },
+        path: { type: 'string', description: 'File path relative to repo root' },
+        start_line: { type: 'integer', description: 'Start line (1-based, default: 1)' },
+        end_line: { type: 'integer', description: 'End line (inclusive, default: end of file)' }
+      },
+      required: ['repo', 'path']
+    },
+    handler: async (args) => {
+      const repoDir = getRepoDir(args.repo);
+      const filePath = validatePath(repoDir, args.path);
+
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`File not found: ${args.path}`);
+      }
+
+      let content = fs.readFileSync(filePath, 'utf8');
+
+      if (args.start_line || args.end_line) {
+        const lines = content.split('\n');
+        const start = (args.start_line || 1) - 1;
+        const end = args.end_line || lines.length;
+        content = lines.slice(start, end).join('\n');
+      }
+
+      // Truncate very large files
+      if (content.length > 100000) {
+        content = content.substring(0, 100000) + '\n\n[... truncated (file too large) ...]';
+      }
+
+      return content;
+    }
+  },
+
+  // === Phase 8: Codebase Analyzer ===
+
+  {
+    name: 'repo_analyze',
+    description: 'Analyze a cloned repository to detect package manager, framework, language, test runner, CI config, and entry points.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository in owner/repo format' }
+      },
+      required: ['repo']
+    },
+    handler: async (args) => {
+      const repoDir = getRepoDir(args.repo);
+      if (!fs.existsSync(repoDir)) {
+        throw new Error('Repository not cloned. Use repo_clone first.');
+      }
+
+      const result = {
+        languages: [],
+        package_manager: null,
+        framework: null,
+        test_runner: null,
+        ci: [],
+        entry_points: [],
+        has_readme: false,
+        has_license: false,
+        file_count: 0,
+        structure: []
+      };
+
+      const rootFiles = fs.readdirSync(repoDir);
+      result.structure = rootFiles.filter(f => f !== '.git');
+
+      // Detect package manager & language
+      if (rootFiles.includes('package.json')) {
+        result.package_manager = rootFiles.includes('yarn.lock') ? 'yarn'
+          : rootFiles.includes('pnpm-lock.yaml') ? 'pnpm' : 'npm';
+        result.languages.push('JavaScript/TypeScript');
+
+        try {
+          const pkg = JSON.parse(fs.readFileSync(path.join(repoDir, 'package.json'), 'utf8'));
+          result.entry_points.push(pkg.main || 'index.js');
+          if (pkg.scripts?.start) result.entry_points.push(`npm start: ${pkg.scripts.start}`);
+
+          // Detect framework
+          const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+          if (allDeps.next) result.framework = 'Next.js';
+          else if (allDeps.react) result.framework = 'React';
+          else if (allDeps.vue) result.framework = 'Vue';
+          else if (allDeps.express) result.framework = 'Express';
+          else if (allDeps.fastify) result.framework = 'Fastify';
+          else if (allDeps.nest || allDeps['@nestjs/core']) result.framework = 'NestJS';
+
+          // Detect test runner
+          if (allDeps.jest) result.test_runner = 'Jest';
+          else if (allDeps.vitest) result.test_runner = 'Vitest';
+          else if (allDeps.mocha) result.test_runner = 'Mocha';
+        } catch (_) {}
+      }
+      if (rootFiles.includes('requirements.txt') || rootFiles.includes('setup.py') || rootFiles.includes('pyproject.toml')) {
+        result.languages.push('Python');
+        result.package_manager = result.package_manager || 'pip';
+        if (rootFiles.includes('pyproject.toml')) {
+          try {
+            const content = fs.readFileSync(path.join(repoDir, 'pyproject.toml'), 'utf8');
+            if (content.includes('pytest')) result.test_runner = result.test_runner || 'pytest';
+            if (content.includes('poetry')) result.package_manager = 'poetry';
+          } catch (_) {}
+        }
+      }
+      if (rootFiles.includes('go.mod')) {
+        result.languages.push('Go');
+        result.package_manager = result.package_manager || 'go modules';
+      }
+      if (rootFiles.includes('Cargo.toml')) {
+        result.languages.push('Rust');
+        result.package_manager = result.package_manager || 'cargo';
+      }
+      if (rootFiles.includes('pom.xml') || rootFiles.includes('build.gradle')) {
+        result.languages.push('Java');
+        result.package_manager = rootFiles.includes('pom.xml') ? 'maven' : 'gradle';
+      }
+      if (rootFiles.find(f => f.endsWith('.csproj') || f.endsWith('.sln'))) {
+        result.languages.push('C#');
+        result.package_manager = result.package_manager || 'dotnet';
+      }
+
+      // Detect CI
+      if (rootFiles.includes('.github')) {
+        try {
+          const workflows = path.join(repoDir, '.github', 'workflows');
+          if (fs.existsSync(workflows)) {
+            result.ci.push('GitHub Actions');
+          }
+        } catch (_) {}
+      }
+      if (rootFiles.includes('.gitlab-ci.yml')) result.ci.push('GitLab CI');
+      if (rootFiles.includes('Jenkinsfile')) result.ci.push('Jenkins');
+      if (rootFiles.includes('.circleci')) result.ci.push('CircleCI');
+      if (rootFiles.includes('.travis.yml')) result.ci.push('Travis CI');
+
+      // Misc
+      result.has_readme = rootFiles.some(f => f.toLowerCase().startsWith('readme'));
+      result.has_license = rootFiles.some(f => f.toLowerCase().startsWith('license'));
+
+      // Count files
+      let count = 0;
+      function countFiles(dir) {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.name === '.git' || e.name === 'node_modules' || e.name === 'vendor') continue;
+          if (e.isDirectory()) countFiles(path.join(dir, e.name));
+          else count++;
+        }
+      }
+      countFiles(repoDir);
+      result.file_count = count;
+
+      return JSON.stringify(result, null, 2);
+    }
+  },
+
+  // === Phase 8: Error Parser ===
+
+  {
+    name: 'parse_error',
+    description: 'Parse a stack trace or error message to extract file paths, line numbers, error type, and error message. Supports JS, Python, Java, Go, Rust, C#.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository in owner/repo format (to cross-reference file paths)' },
+        error_text: { type: 'string', description: 'The full error output or stack trace' }
+      },
+      required: ['error_text']
+    },
+    handler: async (args) => {
+      const errorText = args.error_text;
+      const result = {
+        error_type: null,
+        error_message: null,
+        frames: [],
+        relevant_files: []
+      };
+
+      // Extract error type and message
+      const errorLine = errorText.match(/^(\w+(?:Error|Exception|Panic)?):\s*(.+)$/m);
+      if (errorLine) {
+        result.error_type = errorLine[1];
+        result.error_message = errorLine[2];
+      }
+
+      // JS/Node stack traces: at functionName (file:line:col) or at file:line:col
+      const jsFrames = errorText.matchAll(/at\s+(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?/g);
+      for (const m of jsFrames) {
+        result.frames.push({
+          function: m[1] || null,
+          file: m[2],
+          line: parseInt(m[3]),
+          column: parseInt(m[4])
+        });
+      }
+
+      // Python: File "path", line N, in function
+      const pyFrames = errorText.matchAll(/File "(.+?)", line (\d+)(?:, in (.+))?/g);
+      for (const m of pyFrames) {
+        result.frames.push({
+          file: m[1],
+          line: parseInt(m[2]),
+          function: m[3] || null,
+          column: null
+        });
+      }
+
+      // Go: file.go:line
+      const goFrames = errorText.matchAll(/\t(.+?\.go):(\d+)/g);
+      for (const m of goFrames) {
+        result.frames.push({ file: m[1], line: parseInt(m[2]), function: null, column: null });
+      }
+
+      // Java/C#: at package.Class.method(File.java:line)
+      const javaFrames = errorText.matchAll(/at\s+(.+?)\((\w+\.\w+):(\d+)\)/g);
+      for (const m of javaFrames) {
+        result.frames.push({
+          function: m[1],
+          file: m[2],
+          line: parseInt(m[3]),
+          column: null
+        });
+      }
+
+      // Rust: file.rs:line:col
+      const rustFrames = errorText.matchAll(/-->\s+(.+?\.rs):(\d+):(\d+)/g);
+      for (const m of rustFrames) {
+        result.frames.push({
+          file: m[1],
+          line: parseInt(m[2]),
+          column: parseInt(m[3]),
+          function: null
+        });
+      }
+
+      // Cross-reference with cloned repo if available
+      if (args.repo) {
+        const repoDir = getRepoDir(args.repo);
+        if (fs.existsSync(repoDir)) {
+          for (const frame of result.frames) {
+            const candidate = path.join(repoDir, frame.file);
+            if (fs.existsSync(candidate)) {
+              result.relevant_files.push({
+                path: frame.file,
+                line: frame.line,
+                exists: true
+              });
+            }
+          }
+          // Deduplicate
+          const seen = new Set();
+          result.relevant_files = result.relevant_files.filter(f => {
+            const key = `${f.path}:${f.line}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        }
+      }
+
+      return JSON.stringify(result, null, 2);
+    }
+  },
+
+  // === Shell — arbitrary command execution in per-user workspace ===
+
+  {
+    name: 'shell',
+    description:
+      'Execute an allowed shell command in the user\'s workspace directory. ' +
+      'The leading command must be in the allowlist (common dev tools: git, node, npm, python, make, grep, etc). ' +
+      'Pipes and chaining (|, &&) are supported. Use for running tests, building projects, or analysis tasks.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The shell command to execute' },
+        repo: { type: 'string', description: 'Repository (owner/repo) — command runs in this workspace' },
+        timeout: { type: 'number', description: 'Timeout in seconds (default: 60, max: 300)' }
+      },
+      required: ['command', 'repo']
+    },
+    handler: async (args, context) => {
+      if (!context || !context.userId) {
+        throw new Error('User context is required for shell execution.');
+      }
+
+      const [owner, repo] = args.repo.split('/');
+      if (!owner || !repo) throw new Error('Invalid repo format. Expected "owner/repo".');
+
+      const cwd = getWorkspace(context.userId, owner, repo);
+      if (!fs.existsSync(cwd)) {
+        throw new Error('Workspace not found. Use repo_clone first to set up the workspace.');
+      }
+
+      // Check quota BEFORE execution
+      try {
+        checkWorkspaceQuota(context.userId, owner, repo);
+      } catch (quotaErr) {
+        throw new Error(`Cannot execute: ${quotaErr.message}`);
+      }
+
+      // Validate leading command against allowlist
+      const leadingCmd = extractLeadingCommand(args.command);
+      if (!leadingCmd) {
+        throw new Error('Could not parse a command from the input.');
+      }
+      if (!SHELL_ALLOWLIST.includes(leadingCmd)) {
+        throw new Error(
+          `Command "${leadingCmd}" is not in the shell allowlist. ` +
+          `Allowed: ${SHELL_ALLOWLIST.join(', ')}`
+        );
+      }
+
+      const timeoutSec = Math.min(args.timeout || 60, 300);
+      const timeoutMs = timeoutSec * 1000;
+
+      let stdout = '';
+      let stderr = '';
+      let exitCode = 0;
+
+      try {
+        stdout = execSync(args.command, {
+          cwd,
+          shell: true,
+          timeout: timeoutMs,
+          encoding: 'utf8',
+          stdio: 'pipe',
+          maxBuffer: 5 * 1024 * 1024,
+          env: { ...process.env, HOME: cwd }
+        });
+      } catch (err) {
+        exitCode = err.status || 1;
+        stdout = err.stdout || '';
+        stderr = err.stderr || '';
+      }
+
+      // Scrub PATs from output
+      let output = (stdout + (stderr ? '\n--- stderr ---\n' + stderr : '')).trim();
+      output = output.replace(/ghp_[A-Za-z0-9_]{36,}/g, '[REDACTED]');
+      output = output.replace(/ghs_[A-Za-z0-9_]{36,}/g, '[REDACTED]');
+      output = output.replace(/github_pat_[A-Za-z0-9_]{22,}/g, '[REDACTED]');
+
+      // Truncate large output
+      if (output.length > 50000) {
+        output = output.substring(0, 50000) + '\n\n[... truncated ...]';
+      }
+
+      // Check quota AFTER execution and append warning if needed
+      try {
+        const { sizeBytes, limitBytes } = checkWorkspaceQuota(context.userId, owner, repo);
+        const usagePercent = (sizeBytes / limitBytes * 100).toFixed(0);
+        if (sizeBytes > limitBytes * 0.85) {
+          const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(1);
+          output += `\n\n⚠️ WARNING: Workspace is at ${sizeMB}MB / ${config.maxWorkspaceSizeMB}MB quota (${usagePercent}%). Clean up before running more commands.`;
+        }
+      } catch (_) {
+        // Over quota after execution — warn but don't fail
+        output += `\n\n⚠️ ${_.message}`;
+      }
+
+      if (!output) output = '(no output)';
+
+      return exitCode === 0
+        ? output
+        : `Command exited with code ${exitCode}:\n${output}`;
+    }
+  },
+
+  // === Log Analyzer — streaming parser for large log files ===
+
+  {
+    name: 'analyze_log',
+    description:
+      'Analyze a downloaded log file for errors related to a specific mod. ' +
+      'Uses streaming parsing — handles files up to 50MB efficiently with minimal memory. ' +
+      'Returns a structured summary with deduplicated errors, LUA stack traces, and mod events. ' +
+      'Use github_analyze_issue first to download log files, then call this with the file path.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'Absolute path to the log file (from github_analyze_issue manifest)' },
+        mod_name: { type: 'string', description: 'Mod name to filter for (e.g., "UsedPlus", "FS25_UsedPlus")' },
+        context_before: { type: 'integer', description: 'Lines of context before each error (default: 3)' },
+        context_after: { type: 'integer', description: 'Lines of context after each error (default: 5)' }
+      },
+      required: ['file_path', 'mod_name']
+    },
+    handler: async (args) => {
+      // Validate path exists and is under scratch or workspaces
+      const resolvedPath = path.resolve(args.file_path);
+      const scratchResolved = path.resolve(config.scratchDir);
+      const workspaceResolved = path.resolve(config.workspaceDir);
+
+      if (!resolvedPath.startsWith(scratchResolved) && !resolvedPath.startsWith(workspaceResolved)) {
+        throw new Error('Log file must be in scratch or workspace directory (path traversal blocked).');
+      }
+
+      const result = await analyzeLog(resolvedPath, args.mod_name, {
+        contextBefore: args.context_before,
+        contextAfter: args.context_after
+      });
+
+      // Render for LLM consumption
+      const summary = renderForLLM(result);
+
+      // Also include raw counts for the tool result metadata
+      const metadata = {
+        totalLines: result.totalLines,
+        fileSizeMB: (result.fileSizeBytes / 1024 / 1024).toFixed(1),
+        uniqueErrors: result.errors.size,
+        totalErrorOccurrences: Array.from(result.errors.values()).reduce((s, e) => s + e.count, 0),
+        uniqueWarnings: result.warnings.size,
+        uniqueStacks: result.luaStacks.size,
+        modMentions: result.modMentions,
+        modsLoaded: result.modsLoaded.length
+      };
+
+      return JSON.stringify({ summary, metadata }, null, 2);
     }
   }
+];
 
-  const args = ['git', 'clone'];
-  if (depth > 0) args.push('--depth', String(depth));
-  if (branch) args.push('--branch', branch);
-  args.push(repoUrl, destDir);
-
-  execSync(args.join(' '), { timeout: 120000, stdio: 'pipe' });
-
-  // Get basic stats
-  const files = countFiles(destDir);
-  return {
-    action: 'cloned',
-    directory: repoName,
-    path: destDir,
-    file_count: files,
-  };
-}
-
-export async function list_files({ path = '', recursive = false, max_depth = 3 }) {
-  const dir = path ? scratchPath(path) : config.scratchDir;
-
-  if (!existsSync(dir)) {
-    throw new Error(`Path does not exist: ${path || '(scratch root)'}`);
-  }
-
-  const stat = statSync(dir);
-  if (!stat.isDirectory()) {
-    return { type: 'file', path, size: stat.size };
-  }
-
-  const entries = [];
-  walkDir(dir, dir, entries, recursive, max_depth, 0);
-
-  return { directory: path || '.', entries };
-}
-
-export async function read_file({ path, start_line, end_line }) {
-  const filePath = scratchPath(path);
-
-  if (!existsSync(filePath)) {
-    throw new Error(`File not found: ${path}`);
-  }
-
-  const stat = statSync(filePath);
-  if (stat.isDirectory()) {
-    throw new Error(`Path is a directory, not a file: ${path}`);
-  }
-
-  // Binary check
-  if (stat.size > 1_000_000) {
-    return {
-      path,
-      size: stat.size,
-      note: 'File is larger than 1MB. Use start_line/end_line to read portions.',
-      preview: readFileSync(filePath, 'utf-8').slice(0, 500),
-    };
-  }
-
-  const content = readFileSync(filePath, 'utf-8');
-  const lines = content.split('\n');
-
-  const start = Math.max(1, start_line || 1);
-  const end = Math.min(lines.length, end_line || lines.length);
-  const slice = lines.slice(start - 1, end);
-
-  // Add line numbers
-  const numbered = slice.map((line, i) => `${start + i}: ${line}`).join('\n');
-
-  return {
-    path,
-    total_lines: lines.length,
-    showing: `${start}-${end}`,
-    content: numbered.length > 50000 ? numbered.slice(0, 50000) + '\n...(truncated)' : numbered,
-  };
-}
-
-export async function run_command({ command, cwd = '', timeout = 30 }) {
-  // Sandbox: ensure cwd is within scratch
-  const workDir = cwd ? scratchPath(cwd) : config.scratchDir;
-
-  if (!existsSync(workDir)) {
-    throw new Error(`Working directory does not exist: ${cwd || '(scratch root)'}`);
-  }
-
-  // Block obviously dangerous commands
-  const dangerous = ['rm -rf /', 'mkfs', 'dd if=', ':(){', 'fork bomb'];
-  for (const d of dangerous) {
-    if (command.includes(d)) {
-      throw new Error(`Blocked potentially dangerous command: ${command}`);
-    }
-  }
-
-  try {
-    const output = execSync(command, {
-      cwd: workDir,
-      timeout: timeout * 1000,
-      maxBuffer: 1024 * 1024,
-      stdio: 'pipe',
-      env: { ...process.env, HOME: config.scratchDir },
-    });
-    const text = output.toString('utf-8');
-    return {
-      exit_code: 0,
-      output: text.length > 20000 ? text.slice(0, 20000) + '\n...(truncated)' : text,
-    };
-  } catch (err) {
-    return {
-      exit_code: err.status || 1,
-      output: (err.stdout?.toString('utf-8') || '') + (err.stderr?.toString('utf-8') || ''),
-      error: err.message,
-    };
-  }
-}
-
-// --- Helpers ---
-
-function countFiles(dir) {
-  let count = 0;
-  for (const entry of readdirSync(dir)) {
-    if (entry === '.git') continue;
-    const full = join(dir, entry);
-    const stat = statSync(full);
-    if (stat.isDirectory()) count += countFiles(full);
-    else count++;
-  }
-  return count;
-}
-
-function walkDir(baseDir, currentDir, entries, recursive, maxDepth, currentDepth) {
-  if (currentDepth > maxDepth) return;
-
-  for (const name of readdirSync(currentDir)) {
-    if (name === '.git') continue;
-    const full = join(currentDir, name);
-    const rel = relative(baseDir, full).replace(/\\/g, '/');
-    const stat = statSync(full);
-
-    entries.push({
-      name: rel,
-      type: stat.isDirectory() ? 'directory' : 'file',
-      size: stat.isDirectory() ? undefined : stat.size,
-    });
-
-    if (recursive && stat.isDirectory()) {
-      walkDir(baseDir, full, entries, recursive, maxDepth, currentDepth + 1);
-    }
-  }
-}
+module.exports = { tools };

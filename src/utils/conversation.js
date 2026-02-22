@@ -1,106 +1,98 @@
-import { config } from './config.js';
+const fs = require('fs');
+const path = require('path');
+const config = require('./config');
 
-/**
- * Manages per-channel conversation history for Claude API context.
- * Automatically trims old messages to stay within token budget.
- */
-class ConversationManager {
-  constructor() {
-    // Map<channelId, Message[]>
-    this.histories = new Map();
-  }
+const CONV_DIR = path.join(config.dataDir, 'conversations');
+const MAX_FILE_SIZE = 200 * 1024; // 200KB rotation threshold
 
-  /**
-   * Get conversation history for a channel.
-   */
-  getHistory(channelId) {
-    return this.histories.get(channelId) || [];
-  }
+// channelId -> [{ role, content }]
+const conversations = new Map();
+let loaded = new Set();
 
-  /**
-   * Add a user message to channel history.
-   */
-  addUserMessage(channelId, content, username) {
-    this._ensure(channelId);
-    const history = this.histories.get(channelId);
-    history.push({
-      role: 'user',
-      content: `[${username}]: ${content}`,
-    });
-    this._trim(channelId);
-  }
+function ensureConvDir() {
+  fs.mkdirSync(CONV_DIR, { recursive: true });
+}
 
-  /**
-   * Add an assistant message to channel history.
-   */
-  addAssistantMessage(channelId, content) {
-    this._ensure(channelId);
-    const history = this.histories.get(channelId);
-    history.push({
-      role: 'assistant',
-      content,
-    });
-    this._trim(channelId);
-  }
+function convFile(channelId) {
+  return path.join(CONV_DIR, `${channelId}.json`);
+}
 
-  /**
-   * Add a full tool-use exchange to history.
-   * This stores the assistant's tool_use block and the tool result.
-   */
-  addToolExchange(channelId, assistantMessage, toolResults) {
-    this._ensure(channelId);
-    const history = this.histories.get(channelId);
+function loadFromDisk(channelId) {
+  if (loaded.has(channelId)) return;
+  loaded.add(channelId);
 
-    // Store the full assistant response (may include text + tool_use blocks)
-    history.push({
-      role: 'assistant',
-      content: assistantMessage.content,
-    });
-
-    // Store tool results
-    history.push({
-      role: 'user',
-      content: toolResults,
-    });
-
-    this._trim(channelId);
-  }
-
-  /**
-   * Clear history for a channel.
-   */
-  clearHistory(channelId) {
-    this.histories.delete(channelId);
-  }
-
-  /**
-   * Clear all conversation histories.
-   */
-  clearAll() {
-    this.histories.clear();
-  }
-
-  _ensure(channelId) {
-    if (!this.histories.has(channelId)) {
-      this.histories.set(channelId, []);
+  try {
+    const file = convFile(channelId);
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (Array.isArray(data)) {
+        conversations.set(channelId, data);
+      }
     }
-  }
-
-  _trim(channelId) {
-    const history = this.histories.get(channelId);
-    if (!history) return;
-
-    // Keep only the last N messages
-    while (history.length > config.maxHistoryMessages) {
-      history.shift();
-    }
-
-    // Ensure the first message is always a 'user' role
-    // (Claude API requires user message first)
-    while (history.length > 0 && history[0].role !== 'user') {
-      history.shift();
-    }
+  } catch (err) {
+    console.error(`Failed to load conversation ${channelId}:`, err.message);
   }
 }
 
-export const conversationManager = new ConversationManager();
+let _saveTimers = new Map();
+function scheduleSave(channelId) {
+  if (_saveTimers.has(channelId)) return;
+  _saveTimers.set(channelId, setTimeout(() => {
+    _saveTimers.delete(channelId);
+    try {
+      ensureConvDir();
+      const file = convFile(channelId);
+      const history = conversations.get(channelId) || [];
+      const content = JSON.stringify(history, null, 2);
+
+      // Rotate if file would exceed size limit
+      if (content.length > MAX_FILE_SIZE) {
+        const half = Math.floor(history.length / 2);
+        const trimmed = history.slice(half);
+        conversations.set(channelId, trimmed);
+        fs.writeFileSync(file, JSON.stringify(trimmed, null, 2));
+      } else {
+        fs.writeFileSync(file, content);
+      }
+    } catch (err) {
+      console.error(`Failed to save conversation ${channelId}:`, err.message);
+    }
+  }, 2000));
+}
+
+function getHistory(channelId) {
+  loadFromDisk(channelId);
+  if (!conversations.has(channelId)) {
+    conversations.set(channelId, []);
+  }
+  return conversations.get(channelId);
+}
+
+function addMessage(channelId, role, content) {
+  const history = getHistory(channelId);
+  history.push({ role, content });
+  while (history.length > config.maxConversationMessages) {
+    history.shift();
+  }
+  scheduleSave(channelId);
+}
+
+function clearHistory(channelId) {
+  conversations.delete(channelId);
+  try {
+    const file = convFile(channelId);
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+  } catch (_) {}
+}
+
+function getConversationMessages(channelId) {
+  return getHistory(channelId).slice();
+}
+
+function getSummary(channelId, maxMessages) {
+  const history = getHistory(channelId);
+  const recent = history.slice(-(maxMessages || 10));
+  return recent.map(m => `${m.role}: ${typeof m.content === 'string' ? m.content.substring(0, 200) : '[tool data]'}`).join('\n');
+}
+
+module.exports = { addMessage, clearHistory, getConversationMessages, getSummary };

@@ -1,59 +1,54 @@
-import 'dotenv/config';
+const path = require('path');
 
-export const config = {
-  // Discord
+const config = {
+  // Required
   discordToken: process.env.DISCORD_TOKEN,
-  botPrefix: process.env.BOT_PREFIX || '!claude',
-
-  // Anthropic
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-  model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6-20250514',
-  maxTokens: parseInt(process.env.MAX_TOKENS || '4096', 10),
+  tokenEncryptionSecret: process.env.TOKEN_ENCRYPTION_SECRET,
 
-  // GitHub
-  githubToken: process.env.GITHUB_TOKEN,
-  defaultRepo: process.env.DEFAULT_GITHUB_REPO || '', // e.g. "owner/repo"
+  // Claude
+  claudeModel: process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
+  classifierModel: process.env.CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001',
+  haikuFirstEnabled: process.env.HAIKU_FIRST_ENABLED !== 'false',  // default ON
+  haikuFirstModel: process.env.HAIKU_FIRST_MODEL || process.env.CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001',
+  maxToolIterations: parseInt(process.env.MAX_TOOL_ITERATIONS) || 25,
 
-  // Web Search (Brave Search API)
-  braveApiKey: process.env.BRAVE_API_KEY || '',
+  // Directories
+  scratchDir: path.resolve(process.env.SCRATCH_DIR || './scratch'),
+  workspaceDir: path.resolve(process.env.WORKSPACE_DIR || './workspaces'),
+  dataDir: path.resolve(process.env.DATA_DIR || './data'),
 
-  // Scratch space
-  scratchDir: process.env.SCRATCH_DIR || '/tmp/claude-scratch',
-
-  // Self-modification
-  botSourceDir: process.env.BOT_SOURCE_DIR || '/app',
+  // Workspace limits
+  maxWorkspaceSizeMB: parseInt(process.env.MAX_WORKSPACE_SIZE_MB) || 1024,
+  workspaceTTLDays: parseInt(process.env.WORKSPACE_TTL_DAYS) || 7,
 
   // Conversation
-  maxHistoryMessages: parseInt(process.env.MAX_HISTORY || '50', 10),
-  maxToolIterations: parseInt(process.env.MAX_TOOL_ITERATIONS || '20', 10),
+  maxConversationMessages: parseInt(process.env.MAX_CONVERSATION_MESSAGES) || 50,
 
-  // System prompt
-  systemPrompt: process.env.SYSTEM_PROMPT || `You are Claude, an AI assistant running as a Discord bot. You have access to powerful tools for software engineering tasks.
+  // Thread lifecycle
+  threadInactivityMs: parseInt(process.env.THREAD_INACTIVITY_MS) || 15 * 60 * 1000,
 
-Your capabilities:
-- **GitHub**: Read issues, post comments, download files from issues/repos
-- **Web Search**: Search the web and fetch URL contents
-- **Repository Analysis**: Clone git repos to a scratch space, browse and read files
-- **File Patching**: Edit and patch files in the scratch space
-- **Self-Modification**: Modify your own source code and trigger a restart
+  // Conversation logging
+  maxLogSizeMB: parseInt(process.env.MAX_LOG_SIZE_MB) || 10,
+  logFlushIntervalMs: parseInt(process.env.LOG_FLUSH_INTERVAL_MS) || 2000,
 
-Guidelines:
-- Be concise but thorough. Discord messages have length limits.
-- When analyzing code, read the relevant files before making conclusions.
-- When patching files, show what you changed.
-- Use code blocks with language hints for code output.
-- If a task requires multiple steps, explain your plan briefly then execute.
-- For GitHub operations, confirm destructive actions before proceeding.
-- When self-modifying, explain what you're changing and why before doing it.
-- For write operations (commenting, pushing), the tool result includes auth_source and posted_as fields. Mention whose GitHub identity was used in your response (e.g., "Posted as @username").
-- If a user hasn't registered a personal GitHub token, suggest they DM the bot with \`token set ghp_TOKEN\` for actions to be performed under their identity.`,
+  // Access control
+  ownerId: process.env.OWNER_ID || null,
 };
 
-// Validate required config
-const required = ['discordToken', 'anthropicApiKey'];
-for (const key of required) {
-  if (!config[key]) {
-    console.error(`Missing required environment variable for: ${key}`);
-    process.exit(1);
-  }
+// Validation
+if (!config.discordToken) throw new Error('DISCORD_TOKEN is required');
+if (!config.anthropicApiKey) {
+  console.warn('WARNING: ANTHROPIC_API_KEY not set. Will attempt Claude CLI (Max subscription) as fallback.');
 }
+if (!config.tokenEncryptionSecret) {
+  console.warn('WARNING: TOKEN_ENCRYPTION_SECRET not set. PAT storage will be disabled.');
+}
+
+if (config.ownerId) {
+  console.log(`Access control enabled — owner: ${config.ownerId}`);
+} else {
+  console.log('Access control disabled — all users allowed');
+}
+
+module.exports = config;

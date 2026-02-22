@@ -1,20 +1,15 @@
 {
-  "name": "claude-discord-bot",
-  "version": "1.0.0",
-  "description": "A Claude Code-style Discord bot with GitHub integration, web search, repo analysis, and self-modification capabilities",
-  "type": "module",
-  "main": "src/index.js",
+  "name": "codebot",
+  "version": "2.0.0",
+  "description": "Codebot — Autonomous AI coding assistant for Discord teams",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node index.js"
   },
-  "keywords": ["discord", "bot", "claude", "github", "ai"],
-  "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@octokit/rest": "^21.0.0",
-    "cheerio": "^1.0.0",
     "discord.js": "^14.16.0",
-    "dotenv": "^16.4.0"
+    "dotenv": "^17.3.1"
   }
 }

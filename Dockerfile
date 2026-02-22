@@ -1,30 +1,19 @@
-FROM node:22-slim
+FROM node:20-slim
 
-# Install git (needed for repo cloning) and other useful tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Configure git
-RUN git config --global user.name "Claude Discord Bot" \
-    && git config --global user.email "bot@claude-discord-bot"
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install dependencies first (cache layer)
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev 2>/dev/null || npm install --omit=dev
+# Install Claude CLI when no API key is set (Max subscription routing)
+ARG HAS_API_KEY=false
+RUN if [ "$HAS_API_KEY" != "true" ]; then \
+      npm install -g @anthropic-ai/claude-code && \
+      npm cache clean --force; \
+    fi
 
-# Copy source code
+COPY package*.json ./
+RUN npm ci --production
+
 COPY . .
 
-# Create scratch space
-RUN mkdir -p /tmp/claude-scratch
-
-ENV NODE_ENV=production
-ENV SCRATCH_DIR=/tmp/claude-scratch
-ENV BOT_SOURCE_DIR=/app
-
-CMD ["node", "src/index.js"]
+CMD ["node", "index.js"]

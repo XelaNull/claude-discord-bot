@@ -1,182 +1,149 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
-import { scratchPath } from '../utils/scratch.js';
+const fs = require('fs');
+const path = require('path');
+const { getRepoDir, validatePath } = require('../utils/paths');
 
-// --- Tool definitions ---
+const tools = [
+  {
+    name: 'file_edit',
+    description: 'Edit a file by replacing a specific string with a new string. The old_string must match exactly and be unique in the file.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository in owner/repo format' },
+        path: { type: 'string', description: 'File path relative to repo root' },
+        old_string: { type: 'string', description: 'Exact string to find and replace (must be unique in the file)' },
+        new_string: { type: 'string', description: 'Replacement string' }
+      },
+      required: ['repo', 'path', 'old_string', 'new_string']
+    },
+    handler: async (args) => {
+      const repoDir = getRepoDir(args.repo);
+      const filePath = validatePath(repoDir, args.path);
 
-export const toolDefinitions = [
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`File not found: ${args.path}`);
+      }
+
+      let content = fs.readFileSync(filePath, 'utf8');
+      const count = content.split(args.old_string).length - 1;
+
+      if (count === 0) {
+        throw new Error('old_string not found in file. Make sure it matches exactly including whitespace and indentation.');
+      }
+      if (count > 1) {
+        throw new Error(`old_string found ${count} times. It must be unique. Include more surrounding context to make it unique.`);
+      }
+
+      content = content.replace(args.old_string, args.new_string);
+      fs.writeFileSync(filePath, content);
+
+      return `File edited successfully: ${args.path}`;
+    }
+  },
+
   {
-    name: 'edit_file',
-    description: 'Edit a file in the scratch space by replacing a specific string with new content. The old_string must match exactly (including whitespace/indentation).',
+    name: 'file_write',
+    description: 'Create or overwrite a file with the given content. Creates parent directories as needed.',
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path relative to scratch space.' },
-        old_string: { type: 'string', description: 'The exact string to find and replace. Must be unique in the file.' },
-        new_string: { type: 'string', description: 'The replacement string.' },
-        replace_all: { type: 'boolean', description: 'Replace all occurrences. Default: false.' },
+        repo: { type: 'string', description: 'Repository in owner/repo format' },
+        path: { type: 'string', description: 'File path relative to repo root' },
+        content: { type: 'string', description: 'File content to write' }
       },
-      required: ['path', 'old_string', 'new_string'],
+      required: ['repo', 'path', 'content']
     },
+    handler: async (args) => {
+      const repoDir = getRepoDir(args.repo);
+      const filePath = validatePath(repoDir, args.path);
+
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, args.content);
+
+      return `File written: ${args.path} (${args.content.length} bytes)`;
+    }
   },
+
   {
-    name: 'write_file',
-    description: 'Write or overwrite a file in the scratch space with the given content.',
+    name: 'file_patch',
+    description: 'Apply a unified diff patch to a file. Handles standard unified diff format including "No newline at end of file" markers.',
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path relative to scratch space.' },
-        content: { type: 'string', description: 'The full file content to write.' },
+        repo: { type: 'string', description: 'Repository in owner/repo format' },
+        path: { type: 'string', description: 'File path relative to repo root' },
+        diff: { type: 'string', description: 'Unified diff content to apply' }
       },
-      required: ['path', 'content'],
+      required: ['repo', 'path', 'diff']
     },
-  },
-  {
-    name: 'apply_diff',
-    description: 'Apply a unified diff/patch to a file in the scratch space.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'File path relative to scratch space to patch.' },
-        diff: { type: 'string', description: 'The unified diff content to apply.' },
-      },
-      required: ['path', 'diff'],
-    },
-  },
+    // Phase 1 fix: handle "\ No newline at end of file" and missing context lines
+    handler: async (args) => {
+      const repoDir = getRepoDir(args.repo);
+      const filePath = validatePath(repoDir, args.path);
+
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`File not found: ${args.path}`);
+      }
+
+      const original = fs.readFileSync(filePath, 'utf8');
+      const lines = original.split('\n');
+      const diffLines = args.diff.split('\n');
+
+      const result = [];
+      let lineIdx = 0;
+      let trailingNewline = original.endsWith('\n');
+
+      for (let i = 0; i < diffLines.length; i++) {
+        const line = diffLines[i];
+
+        // Skip diff headers
+        if (line.startsWith('---') || line.startsWith('+++') || line.startsWith('diff ')) continue;
+        // Phase 1 fix: handle "no newline at end of file" marker
+        if (line === '\\ No newline at end of file') {
+          trailingNewline = false;
+          continue;
+        }
+
+        // Hunk header
+        if (line.startsWith('@@')) {
+          const match = line.match(/@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/);
+          if (match) {
+            const startLine = parseInt(match[1]) - 1;
+            // Copy lines before this hunk
+            while (lineIdx < startLine) {
+              result.push(lines[lineIdx++]);
+            }
+          }
+          continue;
+        }
+
+        if (line.startsWith('-')) {
+          lineIdx++; // skip removed line
+        } else if (line.startsWith('+')) {
+          result.push(line.substring(1)); // add new line
+        } else {
+          // Context line (starts with space or is empty)
+          if (lineIdx < lines.length) {
+            result.push(lines[lineIdx++]);
+          }
+        }
+      }
+
+      // Copy remaining lines after last hunk
+      while (lineIdx < lines.length) {
+        result.push(lines[lineIdx++]);
+      }
+
+      let output = result.join('\n');
+      if (trailingNewline && !output.endsWith('\n')) {
+        output += '\n';
+      }
+
+      fs.writeFileSync(filePath, output);
+
+      return `Diff applied to ${args.path}`;
+    }
+  }
 ];
 
-// --- Tool handlers ---
-
-export async function edit_file({ path, old_string, new_string, replace_all = false }) {
-  const filePath = scratchPath(path);
-
-  if (!existsSync(filePath)) {
-    throw new Error(`File not found: ${path}`);
-  }
-
-  let content = readFileSync(filePath, 'utf-8');
-
-  if (!content.includes(old_string)) {
-    // Try to help by showing nearby content
-    const lines = content.split('\n');
-    const preview = lines.slice(0, 20).join('\n');
-    throw new Error(`old_string not found in file. First 20 lines:\n${preview}`);
-  }
-
-  if (!replace_all) {
-    // Ensure old_string is unique
-    const count = content.split(old_string).length - 1;
-    if (count > 1) {
-      throw new Error(`old_string appears ${count} times in the file. Use replace_all: true or provide a more specific string.`);
-    }
-  }
-
-  const newContent = replace_all
-    ? content.replaceAll(old_string, new_string)
-    : content.replace(old_string, new_string);
-
-  writeFileSync(filePath, newContent);
-
-  return {
-    path,
-    action: replace_all ? 'replaced_all' : 'replaced',
-    changes: replace_all ? content.split(old_string).length - 1 : 1,
-  };
-}
-
-export async function write_file({ path, content }) {
-  const filePath = scratchPath(path);
-
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, content);
-
-  return {
-    path,
-    action: 'written',
-    size: Buffer.byteLength(content),
-  };
-}
-
-export async function apply_diff({ path, diff }) {
-  const filePath = scratchPath(path);
-
-  if (!existsSync(filePath)) {
-    throw new Error(`File not found: ${path}`);
-  }
-
-  const content = readFileSync(filePath, 'utf-8');
-  const lines = content.split('\n');
-
-  // Parse unified diff
-  const hunks = parseDiff(diff);
-  if (hunks.length === 0) {
-    throw new Error('Could not parse diff. Ensure it is in unified diff format.');
-  }
-
-  // Apply hunks in reverse order (so line numbers stay valid)
-  const sortedHunks = hunks.sort((a, b) => b.oldStart - a.oldStart);
-
-  for (const hunk of sortedHunks) {
-    const { oldStart, removals, additions } = hunk;
-    const startIdx = oldStart - 1; // Convert to 0-based
-
-    // Verify context matches
-    let lineIdx = startIdx;
-    for (const line of removals) {
-      if (lineIdx >= lines.length || lines[lineIdx] !== line) {
-        throw new Error(`Diff context mismatch at line ${lineIdx + 1}. Expected: "${line}", Got: "${lines[lineIdx] || '(end of file)'}"`);
-      }
-      lineIdx++;
-    }
-
-    // Apply
-    lines.splice(startIdx, removals.length, ...additions);
-  }
-
-  const newContent = lines.join('\n');
-  writeFileSync(filePath, newContent);
-
-  return {
-    path,
-    action: 'patched',
-    hunks_applied: hunks.length,
-  };
-}
-
-// --- Helpers ---
-
-function parseDiff(diff) {
-  const hunks = [];
-  const lines = diff.split('\n');
-
-  let i = 0;
-  while (i < lines.length) {
-    // Find hunk header
-    const match = lines[i].match(/^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/);
-    if (match) {
-      const oldStart = parseInt(match[1], 10);
-      const removals = [];
-      const additions = [];
-
-      i++;
-      while (i < lines.length && !lines[i].startsWith('@@') && !lines[i].startsWith('diff ')) {
-        if (lines[i].startsWith('-')) {
-          removals.push(lines[i].slice(1));
-        } else if (lines[i].startsWith('+')) {
-          additions.push(lines[i].slice(1));
-        } else if (lines[i].startsWith(' ')) {
-          // Context line - include in both
-          removals.push(lines[i].slice(1));
-          additions.push(lines[i].slice(1));
-        }
-        i++;
-      }
-
-      hunks.push({ oldStart, removals, additions });
-    } else {
-      i++;
-    }
-  }
-
-  return hunks;
-}
+module.exports = { tools };

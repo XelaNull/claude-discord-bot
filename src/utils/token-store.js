@@ -1,113 +1,94 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const config = require('./config');
 
-const ALGORITHM = 'aes-256-gcm';
-const STORE_FILE = join(process.env.BOT_SOURCE_DIR || '.', 'data', 'tokens.enc.json');
+const TOKENS_FILE = path.join(config.dataDir, 'tokens.enc.json');
+const AUDIT_FILE = path.join(config.dataDir, 'audit.log');
 
-// Derive encryption key from a secret. If no secret is configured,
-// generate one and warn — tokens won't survive across fresh deployments.
-let encryptionKey;
-let generatedSecret = false;
-
-function getKey() {
-  if (encryptionKey) return encryptionKey;
-
-  let secret = process.env.TOKEN_ENCRYPTION_SECRET;
-  if (!secret) {
-    secret = randomBytes(32).toString('hex');
-    generatedSecret = true;
-    console.warn('[token-store] WARNING: No TOKEN_ENCRYPTION_SECRET configured. Using random key — stored tokens will be lost on restart.');
-  }
-
-  encryptionKey = scryptSync(secret, 'claude-discord-bot-salt', 32);
-  return encryptionKey;
+// Per-user key derivation using PBKDF2 (Phase 1 security hardening)
+function deriveKey(userId) {
+  const salt = `claude-bot:${userId}`;
+  return crypto.pbkdf2Sync(config.tokenEncryptionSecret, salt, 100000, 32, 'sha256');
 }
 
-function encrypt(text) {
-  const iv = randomBytes(16);
-  const cipher = createCipheriv(ALGORITHM, getKey(), iv);
-  let encrypted = cipher.update(text, 'utf-8', 'hex');
+function encrypt(text, userId) {
+  const key = deriveKey(userId);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
   encrypted += cipher.final('hex');
   const tag = cipher.getAuthTag().toString('hex');
   return `${iv.toString('hex')}:${tag}:${encrypted}`;
 }
 
-function decrypt(data) {
+function decrypt(data, userId) {
   const [ivHex, tagHex, encrypted] = data.split(':');
-  const iv = Buffer.from(ivHex, 'hex');
-  const tag = Buffer.from(tagHex, 'hex');
-  const decipher = createDecipheriv(ALGORITHM, getKey(), iv);
-  decipher.setAuthTag(tag);
-  let decrypted = decipher.update(encrypted, 'hex', 'utf-8');
-  decrypted += decipher.final('utf-8');
+  const key = deriveKey(userId);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
   return decrypted;
 }
 
-function loadStore() {
-  if (!existsSync(STORE_FILE)) return {};
+// Audit logging (Phase 1 security hardening — timestamp + userId, never the token)
+function auditLog(action, userId) {
+  const entry = `${new Date().toISOString()} ${action} user=${userId}\n`;
   try {
-    return JSON.parse(readFileSync(STORE_FILE, 'utf-8'));
-  } catch {
-    return {};
+    fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true });
+    fs.appendFileSync(AUDIT_FILE, entry);
+  } catch (_) {}
+}
+
+function loadTokens() {
+  try {
+    if (fs.existsSync(TOKENS_FILE)) {
+      return JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+    }
+  } catch (_) {}
+  return {};
+}
+
+function saveTokens(tokens) {
+  fs.mkdirSync(path.dirname(TOKENS_FILE), { recursive: true });
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+}
+
+function storeToken(userId, token) {
+  if (!config.tokenEncryptionSecret) {
+    throw new Error('TOKEN_ENCRYPTION_SECRET not configured. Cannot store PAT securely.');
   }
+  const tokens = loadTokens();
+  tokens[userId] = encrypt(token, userId);
+  saveTokens(tokens);
+  auditLog('STORE_TOKEN', userId);
 }
 
-function saveStore(store) {
-  mkdirSync(dirname(STORE_FILE), { recursive: true });
-  writeFileSync(STORE_FILE, JSON.stringify(store, null, 2));
-}
-
-/**
- * Store a GitHub PAT for a Discord user (encrypted at rest).
- */
-export function storeToken(discordUserId, githubToken) {
-  const store = loadStore();
-  store[discordUserId] = encrypt(githubToken);
-  saveStore(store);
-}
-
-/**
- * Retrieve a GitHub PAT for a Discord user.
- * Returns null if no token is stored.
- */
-export function getToken(discordUserId) {
-  const store = loadStore();
-  const encrypted = store[discordUserId];
-  if (!encrypted) return null;
-
+function getToken(userId) {
+  if (!config.tokenEncryptionSecret) return null;
+  const tokens = loadTokens();
+  if (!tokens[userId]) return null;
   try {
-    return decrypt(encrypted);
-  } catch {
-    // Decryption failed — key changed or data corrupted
-    console.warn(`[token-store] Failed to decrypt token for user ${discordUserId}`);
+    return decrypt(tokens[userId], userId);
+  } catch (err) {
+    console.error(`Failed to decrypt token for user ${userId}:`, err.message);
     return null;
   }
 }
 
-/**
- * Remove a stored token for a Discord user.
- */
-export function removeToken(discordUserId) {
-  const store = loadStore();
-  if (!store[discordUserId]) return false;
-  delete store[discordUserId];
-  saveStore(store);
-  return true;
+function removeToken(userId) {
+  const tokens = loadTokens();
+  if (tokens[userId]) {
+    delete tokens[userId];
+    saveTokens(tokens);
+    auditLog('REMOVE_TOKEN', userId);
+  }
 }
 
-/**
- * Check if a user has a stored token (without decrypting).
- */
-export function hasToken(discordUserId) {
-  const store = loadStore();
-  return !!store[discordUserId];
+function hasToken(userId) {
+  const tokens = loadTokens();
+  return !!tokens[userId];
 }
 
-/**
- * Whether the encryption key was auto-generated (tokens won't persist).
- */
-export function isEphemeralKey() {
-  getKey(); // ensure initialized
-  return generatedSecret;
-}
+module.exports = { storeToken, getToken, removeToken, hasToken };

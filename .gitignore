@@ -1,5 +1,8 @@
 node_modules/
 .env
-*.log
-scratch/
 data/
+scratch/
+workspaces/
+*.log
+data/conversations/
+data/audit.log

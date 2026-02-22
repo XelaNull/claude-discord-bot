@@ -1,26 +1,24 @@
+name: codebot
+
 services:
-  claude-bot:
-    build: .
-    container_name: claude-discord-bot
+  bot:
+    build:
+      context: .
+      args:
+        # Auto-detect: skip CLI install when API key is set, install when it's not
+        HAS_API_KEY: ${ANTHROPIC_API_KEY:+true}
     restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - NODE_ENV=production
-      - SCRATCH_DIR=/tmp/claude-scratch
-      - BOT_SOURCE_DIR=/app
+    env_file: .env
+    ports:
+      - "${LOCK_PORT:-47100}:${LOCK_PORT:-47100}"
     volumes:
-      # Persist scratch space across restarts
-      - scratch-data:/tmp/claude-scratch
-      # Mount source code so self-modifications persist across rebuilds
-      - ./src:/app/src
-      # Persist encrypted token store and other data
-      - ./data:/app/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - bot-data:/app/data
+      - bot-scratch:/app/scratch
+      - bot-workspaces:/app/workspaces
+      # Max subscription CLI routing: mount host Claude credentials (read-only)
+      - ${USERPROFILE:-${HOME:-/tmp}}/.claude:/root/.claude:ro
 
 volumes:
-  scratch-data:
+  bot-data:
+  bot-scratch:
+  bot-workspaces:
